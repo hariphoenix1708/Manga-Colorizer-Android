@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.webkit.WebResourceResponse
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import com.example.mangacolorizer.data.ProcessState
 import com.example.mangacolorizer.inference.ColorizationManager
 import com.example.mangacolorizer.service.ColorizationService
@@ -12,6 +13,9 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
@@ -23,16 +27,23 @@ class BrowseViewModel @Inject constructor(
     private val _currentUrl = MutableStateFlow("https://www.google.com")
     val currentUrl = _currentUrl.asStateFlow()
 
-    val isColorizing = colorizationManager.isColorizing
-    val isPaused = colorizationManager.isPaused
-    val processingCount = colorizationManager.queueSize
+    val processingState = colorizationManager.processingState
 
     var webViewBundle: android.os.Bundle? = null
 
     init {
         // Sync with existing background state if already running
-        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING) {
-            updateServiceState()
+        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING || colorizationManager.processingState.value.processState == ProcessState.PAUSED) {
+            updateServiceState(colorizationManager.processingState.value.processState)
+        }
+
+        viewModelScope.launch {
+            colorizationManager.processingState
+                .map { it.processState }
+                .distinctUntilChanged()
+                .collect { state ->
+                    updateServiceState(state)
+                }
         }
     }
 
@@ -42,26 +53,33 @@ class BrowseViewModel @Inject constructor(
         }
     }
 
-    fun togglePause() {
-        colorizationManager.togglePause()
-        updateServiceState()
+    fun startProcessing() {
+        colorizationManager.startProcessing()
+    }
+
+    fun pauseProcessing() {
+        colorizationManager.pauseProcessing()
+    }
+
+    fun resumeProcessing() {
+        colorizationManager.resumeProcessing()
+    }
+
+    fun stopProcessing() {
+        colorizationManager.stopProcessing()
     }
 
     fun processDetectedImage(id: String, src: String, referer: String, onComplete: (String) -> Unit) {
         colorizationManager.addImage(id, src, referer, onComplete)
-        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING) {
-            updateServiceState()
-        }
     }
 
-    private fun updateServiceState() {
-        val state = colorizationManager.processingState.value.processState
-        if (state == ProcessState.PAUSED || state == ProcessState.IDLE || state == ProcessState.COMPLETED) {
+    private fun updateServiceState(state: ProcessState) {
+        if (state == ProcessState.IDLE || state == ProcessState.COMPLETED || state == ProcessState.STOPPING) {
             val intent = Intent(context, ColorizationService::class.java).apply {
                 action = ColorizationService.ACTION_STOP
             }
             context.startService(intent)
-        } else {
+        } else if (state == ProcessState.RUNNING || state == ProcessState.PAUSED) {
             val intent = Intent(context, ColorizationService::class.java).apply {
                 action = ColorizationService.ACTION_START
             }

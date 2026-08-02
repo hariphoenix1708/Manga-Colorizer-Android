@@ -28,9 +28,10 @@ import com.example.mangacolorizer.utils.Logger
 @Composable
 fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
     val url by viewModel.currentUrl.collectAsState()
-    val isColorizing by viewModel.isColorizing.collectAsState()
-    val isPaused by viewModel.isPaused.collectAsState()
-    val processingCount by viewModel.processingCount.collectAsState()
+    val processingState by viewModel.processingState.collectAsState()
+    val isPaused = processingState.processState == com.example.mangacolorizer.data.ProcessState.PAUSED
+    val isColorizing = processingState.processState == com.example.mangacolorizer.data.ProcessState.RUNNING
+    val processingCount = processingState.pendingCount
     var webView: WebView? by remember { mutableStateOf(null) }
 
     val isRestoring = remember { mutableStateOf(false) }
@@ -168,11 +169,11 @@ fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
                                 }
 
                                 @JavascriptInterface
-                                fun isPaused(): Boolean = viewModel.isPaused.value
+                                fun isPaused(): Boolean = viewModel.processingState.value.processState == com.example.mangacolorizer.data.ProcessState.PAUSED || viewModel.processingState.value.processState == com.example.mangacolorizer.data.ProcessState.STOPPING || viewModel.processingState.value.processState == com.example.mangacolorizer.data.ProcessState.IDLE
 
                                 @JavascriptInterface
                                 fun onImageDetected(id: String, src: String, referer: String) {
-                                    if (viewModel.isPaused.value) return
+                                    if (viewModel.processingState.value.processState == com.example.mangacolorizer.data.ProcessState.PAUSED || viewModel.processingState.value.processState == com.example.mangacolorizer.data.ProcessState.STOPPING || viewModel.processingState.value.processState == com.example.mangacolorizer.data.ProcessState.IDLE) return
                                     Logger.d("UI: JS found image: $src (ID: $id)")
                                     viewModel.processDetectedImage(id, src, referer) { resultSrc ->
                                         webView?.post {
@@ -239,22 +240,33 @@ fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
         // Floating Start/Stop Button
         ExtendedFloatingActionButton(
             onClick = { 
-                Logger.i("UI: Toggle colorization button pressed")
-                viewModel.togglePause() 
+                Logger.i("UI: Toggle colorization button pressed. Current state: ${processingState.processState}")
+                if (processingState.processState == com.example.mangacolorizer.data.ProcessState.RUNNING) {
+                    viewModel.pauseProcessing()
+                } else if (processingState.processState == com.example.mangacolorizer.data.ProcessState.PAUSED) {
+                    viewModel.resumeProcessing()
+                } else {
+                    viewModel.startProcessing()
+                }
             },
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .padding(bottom = 80.dp, end = 16.dp),
-            containerColor = if (isPaused) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
-            contentColor = if (isPaused) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer,
+            containerColor = if (isColorizing) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer,
+            contentColor = if (isColorizing) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onPrimaryContainer,
             icon = {
                 Icon(
-                    imageVector = if (isPaused) Icons.AutoMirrored.Filled.ArrowForward else Icons.Default.Refresh,
+                    imageVector = if (isColorizing) Icons.Default.Refresh else Icons.AutoMirrored.Filled.ArrowForward,
                     contentDescription = null,
                 )
             },
             text = {
-                Text(if (isPaused) "START COLORING" else "STOP PROCESS")
+                val text = when (processingState.processState) {
+                    com.example.mangacolorizer.data.ProcessState.RUNNING -> "PAUSE PROCESS"
+                    com.example.mangacolorizer.data.ProcessState.PAUSED -> "RESUME PROCESS"
+                    else -> "START COLORING"
+                }
+                Text(text)
             }
         )
     }
@@ -263,7 +275,7 @@ fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
 private fun injectColorizerScript(webView: WebView?) {
     val script = """
         (function() {
-            window.MangaColorizer.log('Script injected (Durable Engine)');
+            window.MangaColorizer.log('Script injected (Durable Engine v10)');
             
             var currentReferer = window.location.href;
             
@@ -339,7 +351,10 @@ private fun injectColorizerScript(webView: WebView?) {
                 if (window.mc_debounce) clearTimeout(window.mc_debounce);
                 window.mc_debounce = setTimeout(processImages, 1000);
             });
-            window.mc_observer.observe(document.body, { childList: true, subtree: true });
+            var target = document.body || document.documentElement;
+            if (target) {
+                window.mc_observer.observe(target, { childList: true, subtree: true });
+            }
             
             window.mc_interval = setInterval(processImages, 4000);
             processImages();

@@ -53,7 +53,8 @@ class ColorizationService : Service() {
             }
             ACTION_STOP -> {
                 Logger.i("ColorizationService: ACTION_STOP received. Stopping service.")
-                manager.stopProcessing()
+                // Stop processing logic is handled by UI/Manager, service just follows manager state
+                // But if explicitly stopped via intent, we stop self.
                 stopServiceCleanly()
             }
         }
@@ -63,16 +64,16 @@ class ColorizationService : Service() {
     private fun startForegroundService() {
         if (isForegroundActive.getAndSet(true)) {
             Logger.d("ColorizationService: Foreground service already active, skipping re-init")
-            return
-        }
+            // We just ensure the collector is running
+        } else {
+            Logger.i("ColorizationService: Entering foreground state")
+            val notification = createNotification("Preparing colorizer...", 0, 0)
 
-        Logger.i("ColorizationService: Entering foreground state")
-        val notification = createNotification("Preparing colorizer...", 0, 0)
-        
-        try {
-            startForeground(NOTIFICATION_ID, notification)
-        } catch (e: Exception) {
-            Logger.e("ColorizationService: Failed to start foreground service", e)
+            try {
+                startForeground(NOTIFICATION_ID, notification)
+            } catch (e: Exception) {
+                Logger.e("ColorizationService: Failed to start foreground service", e)
+            }
         }
         
         collectorJob?.cancel()
@@ -84,8 +85,8 @@ class ColorizationService : Service() {
 
                 Logger.d("ColorizationService: Syncing notification (Status=$status, Processed=$processed, Total=$total, State=${state.processState})")
 
-                if (state.processState == ProcessState.IDLE || state.processState == ProcessState.COMPLETED) {
-                    Logger.i("ColorizationService: Conditions met for termination. Stopping.")
+                if (state.processState == ProcessState.IDLE || state.processState == ProcessState.COMPLETED || state.processState == ProcessState.STOPPING) {
+                    Logger.i("ColorizationService: Conditions met for termination (State: ${state.processState}). Stopping.")
                     stopServiceCleanly()
                 } else {
                     updateNotification(status, processed, total)

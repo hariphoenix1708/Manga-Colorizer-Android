@@ -23,7 +23,9 @@ object AppModule {
             context,
             ColorizationDatabase::class.java,
             "colorization_db"
-        ).build()
+        )
+        .fallbackToDestructiveMigration()
+        .build()
     }
 
     @Provides

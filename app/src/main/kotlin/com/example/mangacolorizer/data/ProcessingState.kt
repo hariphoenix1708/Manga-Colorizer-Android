@@ -7,5 +7,6 @@ data class ProcessingState(
     val completedCount: Int = 0,
     val totalInSession: Int = 0,
     val currentItemSrc: String? = null,
-    val currentStatusText: String = "Idle"
+    val currentStatusText: String = "Idle",
+    val sessionToken: String = ""
 )

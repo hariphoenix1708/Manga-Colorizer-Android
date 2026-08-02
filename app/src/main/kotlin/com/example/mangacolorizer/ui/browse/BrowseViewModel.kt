@@ -32,8 +32,7 @@ class BrowseViewModel @Inject constructor(
     var webViewBundle: android.os.Bundle? = null
 
     init {
-        // Sync with existing background state if already running
-        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING || colorizationManager.processingState.value.processState == ProcessState.PAUSED) {
+        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING) {
             updateServiceState(colorizationManager.processingState.value.processState)
         }
 
@@ -57,14 +56,6 @@ class BrowseViewModel @Inject constructor(
         colorizationManager.startProcessing()
     }
 
-    fun pauseProcessing() {
-        colorizationManager.pauseProcessing()
-    }
-
-    fun resumeProcessing() {
-        colorizationManager.resumeProcessing()
-    }
-
     fun stopProcessing() {
         colorizationManager.stopProcessing()
     }
@@ -74,12 +65,12 @@ class BrowseViewModel @Inject constructor(
     }
 
     private fun updateServiceState(state: ProcessState) {
-        if (state == ProcessState.IDLE || state == ProcessState.COMPLETED || state == ProcessState.STOPPING) {
+        if (state == ProcessState.IDLE) {
             val intent = Intent(context, ColorizationService::class.java).apply {
                 action = ColorizationService.ACTION_STOP
             }
             context.startService(intent)
-        } else if (state == ProcessState.RUNNING || state == ProcessState.PAUSED) {
+        } else if (state == ProcessState.RUNNING) {
             val intent = Intent(context, ColorizationService::class.java).apply {
                 action = ColorizationService.ACTION_START
             }

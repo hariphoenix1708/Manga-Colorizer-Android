@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.*
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.net.URL
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
@@ -25,7 +26,7 @@ class ColorizationManager @Inject constructor(
     private val dao = db.dao()
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val _processingState = MutableStateFlow(ProcessingState())
+    private val _processingState = MutableStateFlow(ProcessingState(sessionToken = UUID.randomUUID().toString()))
     val processingState = _processingState.asStateFlow()
 
     private val memoryCache = ConcurrentHashMap<String, ByteArray>()
@@ -37,8 +38,11 @@ class ColorizationManager @Inject constructor(
     private var completedCount = 0
     private var totalInSession = 0
 
+    @Volatile
+    private var activeSessionToken: String = _processingState.value.sessionToken
+
     init {
-        Logger.i("ColorizationManager: Initializing architecture v10.0")
+        Logger.i("ColorizationManager: Initializing architecture v11.0 (Strict Start/Stop)")
         managerScope.launch {
             // 1. Load persistent app state
             val state = dao.getAppStateSync() ?: AppState()
@@ -47,11 +51,10 @@ class ColorizationManager @Inject constructor(
             dao.clearFinishedItems()
             dao.resetStuckItems()
 
-            // If we restore as RUNNING but loop isn't active, change to PAUSED
-            val restoredState = if (state.processState == ProcessState.RUNNING) ProcessState.PAUSED else state.processState
-            updateState { it.copy(processState = restoredState, currentStatusText = restoredState.name) }
+            // On startup, we always default to IDLE for safety, ensuring the user has to explicitly start
+            changeState(ProcessState.IDLE)
 
-            Logger.i("ColorizationManager: Restored state (processState=$restoredState)")
+            Logger.i("ColorizationManager: Restored state forced to IDLE")
 
             // 2. Observe queue changes
             dao.getQueueItemsFlow()
@@ -65,10 +68,6 @@ class ColorizationManager @Inject constructor(
                         )
                     }
                     Logger.d("ColorizationManager: Queue changed, size=${items.size}, pending=$pendingCount")
-                    
-                    if (_processingState.value.processState == ProcessState.RUNNING && pendingCount > 0 && !isLoopRunning.get()) {
-                        triggerProcessing()
-                    }
                 }
         }
     }
@@ -78,43 +77,34 @@ class ColorizationManager @Inject constructor(
     }
 
     fun startProcessing() {
+        if (_processingState.value.processState == ProcessState.RUNNING) return
         Logger.i("ColorizationManager: Explicit START requested")
-        if (_processingState.value.processState == ProcessState.RUNNING) return
         
-        changeState(ProcessState.RUNNING)
-        triggerProcessing()
-    }
+        activeSessionToken = UUID.randomUUID().toString()
+        completedCount = 0
+        totalInSession = 0
 
-    fun pauseProcessing() {
-        Logger.i("ColorizationManager: Explicit PAUSE requested")
-        if (_processingState.value.processState != ProcessState.RUNNING) return
-
-        changeState(ProcessState.PAUSED)
-        cancelActiveJob("User paused")
-    }
-
-    fun resumeProcessing() {
-        Logger.i("ColorizationManager: Explicit RESUME requested")
-        if (_processingState.value.processState == ProcessState.RUNNING) return
-
+        updateState { it.copy(sessionToken = activeSessionToken, completedCount = 0, totalInSession = 0) }
         changeState(ProcessState.RUNNING)
         triggerProcessing()
     }
 
     fun stopProcessing() {
-        Logger.i("ColorizationManager: Explicit STOP requested")
-        changeState(ProcessState.STOPPING)
-        cancelActiveJob("User stopped")
+        Logger.i("ColorizationManager: Explicit STOP requested (Hard Stop)")
+        val previousToken = activeSessionToken
+        activeSessionToken = UUID.randomUUID().toString()
+
+        updateState { it.copy(processState = ProcessState.IDLE, currentStatusText = "Idle", sessionToken = activeSessionToken, currentItemSrc = null) }
+
+        processingJob?.cancel(CancellationException("Hard Stop requested by user"))
+        isLoopRunning.set(false)
+        pendingCallbacks.clear()
         
         managerScope.launch {
             dao.resetStuckItems()
-            changeState(ProcessState.IDLE)
+            dao.updateAppState(AppState(processState = ProcessState.IDLE))
+            Logger.i("ColorizationManager: Hard stop completed. Token invalidated from $previousToken to $activeSessionToken")
         }
-    }
-
-    private fun cancelActiveJob(reason: String) {
-        processingJob?.cancel(CancellationException(reason))
-        isLoopRunning.set(false)
     }
 
     private fun changeState(newState: ProcessState) {
@@ -131,16 +121,24 @@ class ColorizationManager @Inject constructor(
             return
         }
         
-        Logger.i("ColorizationManager: Launching new processing loop coroutine")
+        Logger.i("ColorizationManager: Launching new processing loop coroutine for token $activeSessionToken")
+        val currentToken = activeSessionToken
+
         processingJob = managerScope.launch {
             var currentItem: QueueItem? = null
             try {
                 while (isActive && _processingState.value.processState == ProcessState.RUNNING) {
+                    if (currentToken != activeSessionToken) {
+                        Logger.i("ColorizationManager: Loop token mismatch. Exiting loop.")
+                        break
+                    }
+
                     currentItem = dao.getNextPendingItem()
                     if (currentItem == null) {
-                        Logger.i("ColorizationManager: Loop finished - Queue empty")
-                        changeState(ProcessState.COMPLETED)
-                        break
+                        // Keep the session alive in a waiting state
+                        updateState { it.copy(currentStatusText = "Waiting for images...", currentItemSrc = null) }
+                        delay(500) // Poll for new items while running
+                        continue
                     }
 
                     val src = currentItem.src
@@ -149,7 +147,13 @@ class ColorizationManager @Inject constructor(
 
                     dao.updateItem(currentItem.copy(status = ItemStatus.PROCESSING))
 
-                    val resultBytes = colorizeImageUrlToBytes(src, currentItem.referer)
+                    val resultBytes = colorizeImageUrlToBytes(src, currentItem.referer, currentToken)
+
+                    if (currentToken != activeSessionToken) {
+                         Logger.w("ColorizationManager: Token changed during inference for $src. Discarding result and rollback.")
+                         dao.updateItem(currentItem.copy(status = ItemStatus.PENDING))
+                         break
+                    }
 
                     if (resultBytes != null && isActive && _processingState.value.processState == ProcessState.RUNNING) {
                         memoryCache[src] = resultBytes
@@ -166,11 +170,12 @@ class ColorizationManager @Inject constructor(
                         completedCount++
                         updateState { it.copy(completedCount = completedCount) }
                     } else {
-                        Logger.w("ColorizationManager: Loop interrupted or item failed. Active=$isActive, State=${_processingState.value.processState}")
-                        if (_processingState.value.processState == ProcessState.STOPPING || _processingState.value.processState == ProcessState.PAUSED || !isActive) {
+                        if (currentToken != activeSessionToken || !isActive) {
+                             Logger.i("ColorizationManager: Loop interrupted safely for $src. Rolling back.")
                              dao.updateItem(currentItem.copy(status = ItemStatus.PENDING))
                              break
                         } else {
+                            Logger.w("ColorizationManager: Item failed or skipped: $src")
                             dao.updateItem(currentItem.copy(status = ItemStatus.FAILED, errorMessage = "Failed to colorize"))
                         }
                     }
@@ -184,9 +189,11 @@ class ColorizationManager @Inject constructor(
                 currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.FAILED, errorMessage = "Fatal error: ${e.message}")) }
             } finally {
                 isLoopRunning.set(false)
-                val finalState = _processingState.value.processState
-                updateState { it.copy(currentStatusText = finalState.name, currentItemSrc = null) }
-                Logger.i("ColorizationManager: Loop exited. Final State=$finalState")
+                if (currentToken == activeSessionToken && _processingState.value.processState == ProcessState.RUNNING) {
+                    Logger.w("ColorizationManager: Processing loop exited unexpectedly while still RUNNING. This shouldn't happen unless task was cancelled.")
+                } else {
+                    Logger.i("ColorizationManager: Loop exited cleanly. Final State=${_processingState.value.processState}")
+                }
             }
         }
     }
@@ -215,7 +222,6 @@ class ColorizationManager @Inject constructor(
                 return@launch
             }
 
-            // Verify if it is already in the queue to avoid duplication if JS bridge sends multiple
             val existing = dao.getItem(src)
             if (existing != null && (existing.status == ItemStatus.COMPLETED || existing.status == ItemStatus.PROCESSING)) {
                 Logger.d("ColorizationManager: Image already processing or completed, skipping add: $src")
@@ -235,7 +241,7 @@ class ColorizationManager @Inject constructor(
         }
     }
 
-    private suspend fun colorizeImageUrlToBytes(imageUrl: String, referer: String): ByteArray? = withContext(Dispatchers.IO) {
+    private suspend fun colorizeImageUrlToBytes(imageUrl: String, referer: String, sessionToken: String): ByteArray? = withContext(Dispatchers.IO) {
         try {
             Logger.d("ColorizationManager: Fetching from network: $imageUrl")
             val url = URL(imageUrl)
@@ -264,9 +270,19 @@ class ColorizationManager @Inject constructor(
                 return@withContext null
             }
             
+            if (sessionToken != activeSessionToken) {
+                Logger.w("ColorizationManager: Token expired before AI inference for $imageUrl")
+                return@withContext null
+            }
+
             Logger.d("ColorizationManager: Handing off to AI engine: $imageUrl")
             val result = colorizer.colorize(bitmap)
             
+            if (sessionToken != activeSessionToken) {
+                Logger.w("ColorizationManager: Token expired after AI inference for $imageUrl. Discarding output.")
+                return@withContext null
+            }
+
             when (result) {
                 is ColorizationResult.Success -> {
                     Logger.d("ColorizationManager: AI colorization finished, saving to disk cache: $imageUrl")

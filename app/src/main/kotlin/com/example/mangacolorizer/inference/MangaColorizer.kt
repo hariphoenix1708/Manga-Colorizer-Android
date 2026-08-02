@@ -100,15 +100,15 @@ class MangaColorizer(private val context: Context) {
         return avgDiff > 30.0f
     }
 
-    suspend fun colorize(bitmap: Bitmap): Bitmap = semaphore.withPermit {
+    suspend fun colorize(bitmap: Bitmap): ColorizationResult = semaphore.withPermit {
         val ortSession = session ?: run {
             Logger.w("AI: colorize called before model loaded")
-            return bitmap
+            return ColorizationResult.Error(IllegalStateException("Model not loaded"))
         }
 
         if (isAlreadyColored(bitmap)) {
             Logger.d("AI: Image already contains color, skipping")
-            return bitmap
+            return ColorizationResult.Skipped(bitmap)
         }
 
         _isBusy.value = true
@@ -130,7 +130,7 @@ class MangaColorizer(private val context: Context) {
             
             _currentProgress.value = 0.3f
             
-            val resultBitmap = withTimeout(60000) { // Increased to 60s for stability
+            val resultBitmap = withTimeout(60000) {
                 ortSession.run(inputs).use { results ->
                     Logger.d("AI: Core inference done in ${System.currentTimeMillis() - startTime}ms")
                     _currentProgress.value = 0.8f
@@ -150,10 +150,10 @@ class MangaColorizer(private val context: Context) {
             
             Logger.i("AI: Colorization complete in ${System.currentTimeMillis() - startTime}ms")
             _currentProgress.value = 1.0f
-            return resultBitmap
+            return ColorizationResult.Success(resultBitmap)
         } catch (e: Exception) {
             Logger.e("AI: Error during colorization", e)
-            return bitmap
+            return ColorizationResult.Error(e)
         } finally {
             _isBusy.value = false
             _currentProgress.value = 0f

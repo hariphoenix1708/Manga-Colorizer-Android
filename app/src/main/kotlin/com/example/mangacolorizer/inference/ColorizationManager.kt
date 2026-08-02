@@ -25,23 +25,14 @@ class ColorizationManager @Inject constructor(
     private val dao = db.dao()
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val _isPaused = MutableStateFlow(true)
-    val isPaused = _isPaused.asStateFlow()
+    private val _processingState = MutableStateFlow(ProcessingState())
+    val processingState = _processingState.asStateFlow()
 
-    private val _isColorizing = MutableStateFlow(false)
-    val isColorizing = _isColorizing.asStateFlow()
-
-    private val _queueSize = MutableStateFlow(0)
-    val queueSize = _queueSize.asStateFlow()
-
-    private val _currentStatus = MutableStateFlow("Idle")
-    val currentStatus = _currentStatus.asStateFlow()
-
-    private val _processedCount = MutableStateFlow(0)
-    val processedCount = _processedCount.asStateFlow()
-
-    private val _totalInQueue = MutableStateFlow(0)
-    val totalInQueue = _totalInQueue.asStateFlow()
+    // For backwards compatibility and easier access
+    val isPaused = _processingState.map { it.processState == ProcessState.PAUSED }.stateIn(managerScope, SharingStarted.Eagerly, true)
+    val isColorizing = _processingState.map { it.processState == ProcessState.RUNNING }.stateIn(managerScope, SharingStarted.Eagerly, false)
+    val queueSize = _processingState.map { it.pendingCount }.stateIn(managerScope, SharingStarted.Eagerly, 0)
+    val currentStatus = _processingState.map { it.currentStatusText }.stateIn(managerScope, SharingStarted.Eagerly, "Idle")
 
     private val memoryCache = ConcurrentHashMap<String, ByteArray>()
     private val pendingCallbacks = ConcurrentHashMap<String, MutableSet<(String) -> Unit>>()
@@ -49,45 +40,67 @@ class ColorizationManager @Inject constructor(
     private val isLoopRunning = AtomicBoolean(false)
     private var processingJob: Job? = null
 
+    private var completedCount = 0
+    private var totalInSession = 0
+
     init {
         Logger.i("ColorizationManager: Initializing architecture v9.0")
         managerScope.launch {
             // 1. Load persistent app state
             val state = dao.getAppStateSync() ?: AppState()
-            _isPaused.value = state.isPaused
-            _processedCount.value = state.processedCount
-            _totalInQueue.value = state.totalInQueue
-            Logger.i("ColorizationManager: Restored state (isPaused=${state.isPaused}, processed=${state.processedCount}, total=${state.totalInQueue})")
+
+            // Clean up any stale processing items and reset stuck ones
+            dao.clearFinishedItems()
+            dao.resetStuckItems()
+
+            updateState { it.copy(processState = state.processState) }
+
+            Logger.i("ColorizationManager: Restored state (processState=${state.processState})")
 
             // 2. Observe queue changes
-            dao.getQueueItems()
-                .distinctUntilChanged()
+            dao.getQueueItemsFlow()
                 .collect { items ->
-                    _queueSize.value = items.size
-                    Logger.d("ColorizationManager: Queue changed, size=${items.size}")
+                    val pendingCount = items.count { it.status == ItemStatus.PENDING }
+
+                    updateState {
+                        it.copy(
+                            queueSize = items.size,
+                            pendingCount = pendingCount
+                        )
+                    }
+                    Logger.d("ColorizationManager: Queue changed, size=${items.size}, pending=$pendingCount")
                     
-                    if (!_isPaused.value && items.isNotEmpty()) {
+                    if ((_processingState.value.processState == ProcessState.RUNNING || _processingState.value.processState == ProcessState.COMPLETED) && pendingCount > 0) {
                         triggerProcessing()
                     }
                 }
         }
     }
 
+    private fun updateState(transform: (ProcessingState) -> ProcessingState) {
+        _processingState.update { transform(it) }
+    }
+
     fun togglePause() {
-        val nextPausedState = !_isPaused.value
-        Logger.i("ColorizationManager: User toggled pause to: $nextPausedState")
+        val currentState = _processingState.value.processState
+        val nextState = if (currentState == ProcessState.PAUSED || currentState == ProcessState.IDLE || currentState == ProcessState.COMPLETED) {
+            ProcessState.RUNNING
+        } else {
+            ProcessState.PAUSED
+        }
+
+        Logger.i("ColorizationManager: User toggled state to: $nextState")
         
-        _isPaused.value = nextPausedState
+        updateState { it.copy(processState = nextState, currentStatusText = if (nextState == ProcessState.PAUSED) "Paused" else "Running") }
         
         managerScope.launch {
-            val currentState = dao.getAppStateSync() ?: AppState()
-            dao.updateAppState(currentState.copy(isPaused = nextPausedState))
+            val appState = dao.getAppStateSync() ?: AppState()
+            dao.updateAppState(appState.copy(processState = nextState))
             
-            if (nextPausedState) {
+            if (nextState == ProcessState.PAUSED) {
                 Logger.i("ColorizationManager: Cancelling processing job due to pause")
                 processingJob?.cancel("User paused")
                 isLoopRunning.set(false)
-                _isColorizing.value = false
             } else {
                 triggerProcessing()
             }
@@ -102,25 +115,33 @@ class ColorizationManager @Inject constructor(
         
         Logger.i("ColorizationManager: Launching new processing loop coroutine")
         processingJob = managerScope.launch {
-            _isColorizing.value = true
+            updateState { it.copy(processState = ProcessState.RUNNING) }
+            var currentItem: QueueItem? = null
             try {
-                while (isActive && !_isPaused.value) {
-                    val item = dao.getNextItem()
-                    if (item == null) {
+                while (isActive && _processingState.value.processState == ProcessState.RUNNING) {
+                    currentItem = dao.getNextPendingItem()
+                    if (currentItem == null) {
                         Logger.i("ColorizationManager: Loop finished - Queue empty")
-                        _totalInQueue.value = 0
-                        _processedCount.value = 0
+                        updateState {
+                            it.copy(
+                                processState = ProcessState.COMPLETED,
+                                currentStatusText = "Completed",
+                                currentItemSrc = null
+                            )
+                        }
                         updatePersistentAppState()
                         break
                     }
 
-                    val src = item.src
+                    val src = currentItem.src
                     Logger.i("ColorizationManager: Starting next item: $src")
-                    _currentStatus.value = "Colorizing: ${getFileName(src)}"
+                    updateState { it.copy(currentItemSrc = src, currentStatusText = "Colorizing: ${getFileName(src)}") }
 
-                    val resultBytes = colorizeImageUrlToBytes(src, item.referer)
+                    dao.updateItem(currentItem.copy(status = ItemStatus.PROCESSING))
 
-                    if (resultBytes != null && isActive && !_isPaused.value) {
+                    val resultBytes = colorizeImageUrlToBytes(src, currentItem.referer)
+
+                    if (resultBytes != null && isActive && _processingState.value.processState == ProcessState.RUNNING) {
                         memoryCache[src] = resultBytes
                         Logger.i("ColorizationManager: Successfully colorized and cached: $src")
                         
@@ -131,50 +152,57 @@ class ColorizationManager @Inject constructor(
                         }
                         
                         // Commit progress
-                        dao.deleteItem(item)
-                        _processedCount.value++
-                    } else if (!isActive || _isPaused.value) {
+                        dao.updateItem(currentItem.copy(status = ItemStatus.COMPLETED))
+                        completedCount++
+                        updateState { it.copy(completedCount = completedCount) }
+                    } else if (!isActive || _processingState.value.processState == ProcessState.PAUSED) {
                         Logger.i("ColorizationManager: Loop interrupted while processing: $src")
+                        dao.updateItem(currentItem.copy(status = ItemStatus.PENDING)) // Reset back to pending
                         break
                     } else {
                         Logger.w("ColorizationManager: Item failed or skipped: $src")
-                        dao.deleteItem(item)
-                        _totalInQueue.value = maxOf(0, _totalInQueue.value - 1)
+                        dao.updateItem(currentItem.copy(status = ItemStatus.FAILED, errorMessage = "Failed to colorize"))
                     }
                     updatePersistentAppState()
+                    currentItem = null
                 }
             } catch (e: Exception) {
-                if (e !is CancellationException) {
-                    Logger.e("ColorizationManager: Fatal exception in processing loop", e)
+                if (e is CancellationException) {
+                   Logger.i("ColorizationManager: Task cancelled (Coroutine). Rolling back current item.")
+                   currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.PENDING)) }
+                } else {
+                   Logger.e("ColorizationManager: Fatal exception in processing loop", e)
+                   currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.FAILED, errorMessage = "Fatal error: ${e.message}")) }
                 }
             } finally {
-                _isColorizing.value = false
                 isLoopRunning.set(false)
-                _currentStatus.value = if (_isPaused.value) "Paused" else if (_queueSize.value == 0) "Completed" else "Idle"
-                Logger.i("ColorizationManager: Loop exited. Status=${_currentStatus.value}")
+                val finalState = _processingState.value
+                val statusText = when (finalState.processState) {
+                    ProcessState.PAUSED -> "Paused"
+                    ProcessState.COMPLETED -> "Completed"
+                    ProcessState.IDLE -> "Idle"
+                    ProcessState.RUNNING -> "Idle" // Should not happen but fallback
+                }
+                updateState { it.copy(currentStatusText = statusText, currentItemSrc = null) }
+                Logger.i("ColorizationManager: Loop exited. Status=${statusText}")
             }
         }
     }
 
     private suspend fun updatePersistentAppState() {
-        val state = AppState(
-            isPaused = _isPaused.value,
-            processedCount = _processedCount.value,
-            totalInQueue = _totalInQueue.value
-        )
-        dao.updateAppState(state)
+        val appState = dao.getAppStateSync() ?: AppState()
+        dao.updateAppState(appState.copy(processState = _processingState.value.processState))
     }
 
     fun stopProcessing() {
         Logger.i("ColorizationManager: Explicit stop requested")
-        _isPaused.value = true
+        updateState { it.copy(processState = ProcessState.IDLE, currentStatusText = "Idle") }
         processingJob?.cancel("Stop requested")
         isLoopRunning.set(false)
-        _isColorizing.value = false
         
         managerScope.launch {
-            val currentState = dao.getAppStateSync() ?: AppState()
-            dao.updateAppState(currentState.copy(isPaused = true))
+            val appState = dao.getAppStateSync() ?: AppState()
+            dao.updateAppState(appState.copy(processState = ProcessState.IDLE))
         }
     }
 
@@ -187,7 +215,7 @@ class ColorizationManager @Inject constructor(
         }
     }
 
-    fun addImage(@Suppress("UNUSED_PARAMETER") id: String, src: String, referer: String, onComplete: (String) -> Unit) {
+    fun addImage(id: String, src: String, referer: String, onComplete: (String) -> Unit) {
         managerScope.launch {
             // Check memory then disk cache
             val cached = memoryCache[src] ?: cache.get(src)?.let { 
@@ -208,12 +236,11 @@ class ColorizationManager @Inject constructor(
             
             dao.insertItem(QueueItem(src, referer))
             
-            // Recalculate total for UI precision
-            val currentQueueSize = dao.getQueueItems().first().size
-            _totalInQueue.value = _processedCount.value + currentQueueSize
+            totalInSession++
+            updateState { it.copy(totalInSession = totalInSession) }
             updatePersistentAppState()
 
-            if (!_isPaused.value) {
+            if (_processingState.value.processState == ProcessState.RUNNING || _processingState.value.processState == ProcessState.COMPLETED) {
                 triggerProcessing()
             }
         }
@@ -249,18 +276,26 @@ class ColorizationManager @Inject constructor(
             }
             
             Logger.d("ColorizationManager: Handing off to AI engine: $imageUrl")
-            val colorized = colorizer.colorize(bitmap)
+            val result = colorizer.colorize(bitmap)
             
-            Logger.d("ColorizationManager: AI colorization finished, saving to disk cache: $imageUrl")
-            cache.put(imageUrl, colorized)
-            
-            bitmapToBytes(colorized)
-        } catch (e: CancellationException) {
-            Logger.i("ColorizationManager: Task cancelled (Coroutine) for: $imageUrl")
+            when (result) {
+                is ColorizationResult.Success -> {
+                    Logger.d("ColorizationManager: AI colorization finished, saving to disk cache: $imageUrl")
+                    cache.put(imageUrl, result.bitmap)
+                    bitmapToBytes(result.bitmap)
+                }
+                is ColorizationResult.Skipped -> {
+                    Logger.d("ColorizationManager: AI colorization skipped, image already colored: $imageUrl")
+                    cache.put(imageUrl, result.bitmap)
+                    bitmapToBytes(result.bitmap)
+                }
+                is ColorizationResult.Error -> {
+                    Logger.e("ColorizationManager: AI colorization failed for $imageUrl", result.exception)
+                    null
+                }
+            }
+        } catch (e: Exception) { // Also catches CancellationException now, handled up in loop
             throw e
-        } catch (e: Exception) {
-            Logger.e("ColorizationManager: Error during download/AI processing for $imageUrl", e)
-            null
         }
     }
 

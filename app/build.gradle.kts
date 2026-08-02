@@ -44,7 +44,7 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = false // This prevents extraction, meaning it uses page-aligned libraries at runtime
         }
     }
 }

@@ -13,14 +13,14 @@ import com.example.mangacolorizer.ui.reader.ReaderViewModel
 
 @Composable
 fun LibraryScreen(viewModel: ReaderViewModel) {
-    var hasSelectedImages by remember { mutableStateOf(false) }
+    val pages by viewModel.pages.collectAsState()
+    val hasSelectedImages = pages.isNotEmpty()
 
     val pickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         if (uris.isNotEmpty()) {
             viewModel.loadPages(uris.map { it.toString() })
-            hasSelectedImages = true
         }
     }
 
@@ -41,6 +41,20 @@ fun LibraryScreen(viewModel: ReaderViewModel) {
                  color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     } else {
-        ReaderScreen(viewModel)
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.End
+            ) {
+                Button(onClick = { viewModel.clearPages() }) {
+                    Text("Close Reader")
+                }
+            }
+            Box(modifier = Modifier.weight(1f)) {
+                ReaderScreen(viewModel)
+            }
+        }
     }
 }

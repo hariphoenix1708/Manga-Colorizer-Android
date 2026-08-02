@@ -19,7 +19,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MangaColorizerAndroid"
         android:requestLegacyExternalStorage="true"
-        android:extractNativeLibs="true">
+        android:extractNativeLibs="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

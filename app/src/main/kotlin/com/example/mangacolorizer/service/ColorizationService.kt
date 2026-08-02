@@ -6,12 +6,15 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.example.mangacolorizer.MainActivity
+import com.example.mangacolorizer.data.ProcessState
 import com.example.mangacolorizer.inference.ColorizationManager
 import com.example.mangacolorizer.utils.Logger
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import javax.inject.Inject
+import java.util.concurrent.atomic.AtomicBoolean
 
 @AndroidEntryPoint
 class ColorizationService : Service() {
@@ -20,6 +23,8 @@ class ColorizationService : Service() {
     lateinit var manager: ColorizationManager
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var isForegroundActive = AtomicBoolean(false)
+    private var collectorJob: Job? = null
 
     companion object {
         private const val CHANNEL_ID = "colorization_channel"
@@ -49,14 +54,18 @@ class ColorizationService : Service() {
             ACTION_STOP -> {
                 Logger.i("ColorizationService: ACTION_STOP received. Stopping service.")
                 manager.stopProcessing()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                stopServiceCleanly()
             }
         }
         return START_NOT_STICKY
     }
 
     private fun startForegroundService() {
+        if (isForegroundActive.getAndSet(true)) {
+            Logger.d("ColorizationService: Foreground service already active, skipping re-init")
+            return
+        }
+
         Logger.i("ColorizationService: Entering foreground state")
         val notification = createNotification("Preparing colorizer...", 0, 0)
         
@@ -66,31 +75,30 @@ class ColorizationService : Service() {
             Logger.e("ColorizationService: Failed to start foreground service", e)
         }
         
-        serviceScope.launch {
-            combine(
-                manager.currentStatus,
-                manager.processedCount,
-                manager.totalInQueue,
-                manager.isColorizing,
-                manager.isPaused
-            ) { status, processed, total, isColorizing, isPaused ->
-                Logger.d("ColorizationService: Syncing notification (Status=$status, Processed=$processed, Total=$total, Active=$isColorizing, Paused=$isPaused)")
-                if (isPaused || (!isColorizing && total == 0)) {
-                    null // Signal termination
-                } else {
-                    Triple(status, processed, total)
-                }
-            }.collect { data ->
-                if (data == null) {
+        collectorJob?.cancel()
+        collectorJob = serviceScope.launch {
+            manager.processingState.collect { state ->
+                val status = state.currentStatusText
+                val processed = state.completedCount
+                val total = state.totalInSession
+
+                Logger.d("ColorizationService: Syncing notification (Status=$status, Processed=$processed, Total=$total, State=${state.processState})")
+
+                if (state.processState == ProcessState.IDLE || state.processState == ProcessState.COMPLETED) {
                     Logger.i("ColorizationService: Conditions met for termination. Stopping.")
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    stopServiceCleanly()
                 } else {
-                    val (status, processed, total) = data
                     updateNotification(status, processed, total)
                 }
             }
         }
+    }
+
+    private fun stopServiceCleanly() {
+        isForegroundActive.set(false)
+        collectorJob?.cancel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun createNotification(content: String, progress: Int, max: Int): Notification {

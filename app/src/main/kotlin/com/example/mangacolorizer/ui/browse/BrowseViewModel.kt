@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.webkit.WebResourceResponse
 import androidx.lifecycle.ViewModel
+import com.example.mangacolorizer.data.ProcessState
 import com.example.mangacolorizer.inference.ColorizationManager
 import com.example.mangacolorizer.service.ColorizationService
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -30,7 +31,7 @@ class BrowseViewModel @Inject constructor(
 
     init {
         // Sync with existing background state if already running
-        if (!colorizationManager.isPaused.value && colorizationManager.queueSize.value > 0) {
+        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING) {
             updateServiceState()
         }
     }
@@ -48,13 +49,14 @@ class BrowseViewModel @Inject constructor(
 
     fun processDetectedImage(id: String, src: String, referer: String, onComplete: (String) -> Unit) {
         colorizationManager.addImage(id, src, referer, onComplete)
-        if (!colorizationManager.isPaused.value) {
+        if (colorizationManager.processingState.value.processState == ProcessState.RUNNING) {
             updateServiceState()
         }
     }
 
     private fun updateServiceState() {
-        if (colorizationManager.isPaused.value || colorizationManager.queueSize.value == 0) {
+        val state = colorizationManager.processingState.value.processState
+        if (state == ProcessState.PAUSED || state == ProcessState.IDLE || state == ProcessState.COMPLETED) {
             val intent = Intent(context, ColorizationService::class.java).apply {
                 action = ColorizationService.ACTION_STOP
             }

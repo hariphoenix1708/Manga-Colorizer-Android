@@ -263,12 +263,7 @@ fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
 private fun injectColorizerScript(webView: WebView?) {
     val script = """
         (function() {
-            if (window.MangaColorizerLoaded) {
-                window.MangaColorizer.log('Script already running, skipping re-init');
-                return;
-            }
-            window.MangaColorizerLoaded = true;
-            window.MangaColorizer.log('Script v8.4 (Durable Engine) initialized');
+            window.MangaColorizer.log('Script injected (Durable Engine)');
             
             var currentReferer = window.location.href;
             
@@ -279,13 +274,9 @@ private fun injectColorizerScript(webView: WebView?) {
             }
 
             function processImages() {
-                if (window.MangaColorizer.isPaused()) return;
-
                 var elements = document.querySelectorAll('img, [data-src], [data-lazy-src], [srcset], div[style*="background-image"]');
                 
                 elements.forEach(function(el, index) {
-                    if (el.dataset.processed === 'true' || el.dataset.colorizing === 'true') return;
-                    
                     try {
                         var src = el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || el.src;
                         if (!src && el.srcset) src = el.srcset.split(',')[0].trim().split(' ')[0];
@@ -312,6 +303,19 @@ private fun injectColorizerScript(webView: WebView?) {
                              el.id = sid;
                         }
                         
+                        // Skip if currently colorizing or already successfully processed (by looking at dataset)
+                        if (el.dataset.processed === 'true' || el.dataset.colorizing === 'true') {
+                            // If it's supposedly processed but the src reverted (e.g. from a tab switch or JS framework),
+                            // we need to ask the app if it has a cached version.
+                            if (el.dataset.processed === 'true' && !src.startsWith('https://mc-local.com')) {
+                                el.dataset.processed = 'false'; // force re-check cache
+                            } else {
+                                return;
+                            }
+                        }
+
+                        if (window.MangaColorizer.isPaused()) return;
+
                         el.dataset.colorizing = 'true';
                         el.style.filter = 'sepia(1) hue-rotate(200deg) saturate(300%)';
                         el.style.transition = 'filter 0.5s';
@@ -323,13 +327,21 @@ private fun injectColorizerScript(webView: WebView?) {
                 });
             }
             
-            var observer = new MutationObserver(function(mutations) {
+            // Allow multiple injections to restart processing safely
+            if (window.mc_observer) {
+                window.mc_observer.disconnect();
+            }
+            if (window.mc_interval) {
+                clearInterval(window.mc_interval);
+            }
+
+            window.mc_observer = new MutationObserver(function(mutations) {
                 if (window.mc_debounce) clearTimeout(window.mc_debounce);
                 window.mc_debounce = setTimeout(processImages, 1000);
             });
-            observer.observe(document.body, { childList: true, subtree: true });
+            window.mc_observer.observe(document.body, { childList: true, subtree: true });
             
-            setInterval(processImages, 4000);
+            window.mc_interval = setInterval(processImages, 4000);
             processImages();
         })();
     """.trimIndent()

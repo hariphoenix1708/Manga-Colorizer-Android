@@ -85,7 +85,7 @@ class ColorizationService : Service() {
 
                 Logger.d("ColorizationService: Syncing notification (Status=$status, Processed=$processed, Total=$total, State=${state.processState})")
 
-                if (state.processState == ProcessState.IDLE || state.processState == ProcessState.COMPLETED || state.processState == ProcessState.STOPPING) {
+                if (state.processState == ProcessState.IDLE) {
                     Logger.i("ColorizationService: Conditions met for termination (State: ${state.processState}). Stopping.")
                     stopServiceCleanly()
                 } else {

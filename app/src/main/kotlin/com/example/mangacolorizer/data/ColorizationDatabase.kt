@@ -17,7 +17,7 @@ data class QueueItem(
 )
 
 enum class ProcessState {
-    IDLE, RUNNING, PAUSED, COMPLETED
+    IDLE, RUNNING, PAUSED, STOPPING, COMPLETED
 }
 
 @Entity(tableName = "app_state")
@@ -66,7 +66,7 @@ interface ColorizationDao {
     suspend fun updateAppState(state: AppState)
 }
 
-@Database(entities = [QueueItem::class, AppState::class], version = 3, exportSchema = false)
+@Database(entities = [QueueItem::class, AppState::class], version = 4, exportSchema = false)
 abstract class ColorizationDatabase : RoomDatabase() {
     abstract fun dao(): ColorizationDao
 }

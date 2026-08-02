@@ -20,6 +20,7 @@ fun LibraryScreen(viewModel: ReaderViewModel) {
         ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         if (uris.isNotEmpty()) {
+            com.example.mangacolorizer.utils.Logger.i("UI: LibraryScreen - Selected ${uris.size} images to load")
             viewModel.loadPages(uris.map { it.toString() })
         }
     }

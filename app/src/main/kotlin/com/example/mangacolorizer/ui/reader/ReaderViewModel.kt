@@ -11,8 +11,10 @@ import coil.request.ImageRequest
 import com.example.mangacolorizer.inference.ColorizationCache
 import com.example.mangacolorizer.inference.ColorizationResult
 import com.example.mangacolorizer.inference.MangaColorizer
+import com.example.mangacolorizer.utils.Logger
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,11 +45,13 @@ class ReaderViewModel @Inject constructor(
     init {
         val restoredUris = savedStateHandle.get<List<String>>("loaded_uris")
         if (restoredUris != null) {
+            Logger.i("ReaderViewModel: Restoring ${restoredUris.size} pages from SavedStateHandle")
             loadPages(restoredUris)
         }
     }
 
     fun loadPages(uris: List<String>) {
+        Logger.i("ReaderViewModel: Loading ${uris.size} pages")
         savedStateHandle["loaded_uris"] = uris
         _pages.value = uris.map { uri ->
             PageState(uri, colorizedBitmap = cache.get(uri))
@@ -55,6 +59,7 @@ class ReaderViewModel @Inject constructor(
     }
 
     fun clearPages() {
+        Logger.i("ReaderViewModel: Clearing all pages and stopping jobs")
         savedStateHandle.remove<List<String>>("loaded_uris")
         _pages.value = emptyList()
         processingJobs.values.forEach { it.cancel() }
@@ -74,6 +79,8 @@ class ReaderViewModel @Inject constructor(
         val currentPage = _pages.value.getOrNull(index) ?: return
         if (currentPage.colorizedBitmap != null || currentPage.isProcessing) return
 
+        Logger.d("ReaderViewModel: Starting colorization for page $index (${currentPage.originalUri})")
+
         processingJobs[index] = viewModelScope.launch {
             updatePageState(index) { it.copy(isProcessing = true) }
             
@@ -85,24 +92,32 @@ class ReaderViewModel @Inject constructor(
                         val colorizeResult = colorizer.colorize(bitmapToProcess)
                         when (colorizeResult) {
                             is ColorizationResult.Success -> {
+                                Logger.d("ReaderViewModel: Successfully colorized page $index")
                                 cache.put(currentPage.originalUri, colorizeResult.bitmap)
                                 colorizeResult.bitmap
                             }
                             is ColorizationResult.Skipped -> {
+                                Logger.d("ReaderViewModel: Skipped colorization for page $index (already colored)")
                                 cache.put(currentPage.originalUri, colorizeResult.bitmap)
                                 colorizeResult.bitmap
                             }
                             is ColorizationResult.Error -> {
-                                android.util.Log.e("ReaderViewModel", "Colorization failed: ${colorizeResult.exception.message}")
+                                Logger.e("ReaderViewModel: Colorization failed for page $index", colorizeResult.exception)
                                 null
                             }
                         }
+                    } catch (e: CancellationException) {
+                        Logger.i("ReaderViewModel: Colorization cancelled for page $index")
+                        throw e
                     } catch (e: Exception) {
-                        android.util.Log.e("ReaderViewModel", "Colorization crashed: ${e.message}")
+                        Logger.e("ReaderViewModel: Colorization crashed for page $index", e)
                         null
                     }
                 }
-            } else null
+            } else {
+                 Logger.e("ReaderViewModel: Failed to fetch bitmap for page $index")
+                 null
+            }
 
             updatePageState(index) { it.copy(colorizedBitmap = result, isProcessing = false) }
             processingJobs.remove(index)
@@ -116,13 +131,18 @@ class ReaderViewModel @Inject constructor(
     }
 
     private suspend fun fetchBitmap(uri: String): Bitmap? = withContext(Dispatchers.IO) {
-        val loader = ImageLoader(context)
-        val request = ImageRequest.Builder(context)
-            .data(uri)
-            .allowHardware(false)
-            .build()
-        val result = loader.execute(request)
-        (result.drawable as? BitmapDrawable)?.bitmap
+        try {
+            val loader = ImageLoader(context)
+            val request = ImageRequest.Builder(context)
+                .data(uri)
+                .allowHardware(false)
+                .build()
+            val result = loader.execute(request)
+            (result.drawable as? BitmapDrawable)?.bitmap
+        } catch (e: Exception) {
+            Logger.e("ReaderViewModel: fetchBitmap failed for $uri", e)
+            null
+        }
     }
 
     private fun updatePageState(index: Int, transform: (PageState) -> PageState) {

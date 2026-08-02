@@ -28,12 +28,6 @@ class ColorizationManager @Inject constructor(
     private val _processingState = MutableStateFlow(ProcessingState())
     val processingState = _processingState.asStateFlow()
 
-    // For backwards compatibility and easier access
-    val isPaused = _processingState.map { it.processState == ProcessState.PAUSED }.stateIn(managerScope, SharingStarted.Eagerly, true)
-    val isColorizing = _processingState.map { it.processState == ProcessState.RUNNING }.stateIn(managerScope, SharingStarted.Eagerly, false)
-    val queueSize = _processingState.map { it.pendingCount }.stateIn(managerScope, SharingStarted.Eagerly, 0)
-    val currentStatus = _processingState.map { it.currentStatusText }.stateIn(managerScope, SharingStarted.Eagerly, "Idle")
-
     private val memoryCache = ConcurrentHashMap<String, ByteArray>()
     private val pendingCallbacks = ConcurrentHashMap<String, MutableSet<(String) -> Unit>>()
     
@@ -44,7 +38,7 @@ class ColorizationManager @Inject constructor(
     private var totalInSession = 0
 
     init {
-        Logger.i("ColorizationManager: Initializing architecture v9.0")
+        Logger.i("ColorizationManager: Initializing architecture v10.0")
         managerScope.launch {
             // 1. Load persistent app state
             val state = dao.getAppStateSync() ?: AppState()
@@ -53,9 +47,11 @@ class ColorizationManager @Inject constructor(
             dao.clearFinishedItems()
             dao.resetStuckItems()
 
-            updateState { it.copy(processState = state.processState) }
+            // If we restore as RUNNING but loop isn't active, change to PAUSED
+            val restoredState = if (state.processState == ProcessState.RUNNING) ProcessState.PAUSED else state.processState
+            updateState { it.copy(processState = restoredState, currentStatusText = restoredState.name) }
 
-            Logger.i("ColorizationManager: Restored state (processState=${state.processState})")
+            Logger.i("ColorizationManager: Restored state (processState=$restoredState)")
 
             // 2. Observe queue changes
             dao.getQueueItemsFlow()
@@ -70,7 +66,7 @@ class ColorizationManager @Inject constructor(
                     }
                     Logger.d("ColorizationManager: Queue changed, size=${items.size}, pending=$pendingCount")
                     
-                    if ((_processingState.value.processState == ProcessState.RUNNING || _processingState.value.processState == ProcessState.COMPLETED) && pendingCount > 0) {
+                    if (_processingState.value.processState == ProcessState.RUNNING && pendingCount > 0 && !isLoopRunning.get()) {
                         triggerProcessing()
                     }
                 }
@@ -81,29 +77,51 @@ class ColorizationManager @Inject constructor(
         _processingState.update { transform(it) }
     }
 
-    fun togglePause() {
-        val currentState = _processingState.value.processState
-        val nextState = if (currentState == ProcessState.PAUSED || currentState == ProcessState.IDLE || currentState == ProcessState.COMPLETED) {
-            ProcessState.RUNNING
-        } else {
-            ProcessState.PAUSED
-        }
-
-        Logger.i("ColorizationManager: User toggled state to: $nextState")
+    fun startProcessing() {
+        Logger.i("ColorizationManager: Explicit START requested")
+        if (_processingState.value.processState == ProcessState.RUNNING) return
         
-        updateState { it.copy(processState = nextState, currentStatusText = if (nextState == ProcessState.PAUSED) "Paused" else "Running") }
+        changeState(ProcessState.RUNNING)
+        triggerProcessing()
+    }
+
+    fun pauseProcessing() {
+        Logger.i("ColorizationManager: Explicit PAUSE requested")
+        if (_processingState.value.processState != ProcessState.RUNNING) return
+
+        changeState(ProcessState.PAUSED)
+        cancelActiveJob("User paused")
+    }
+
+    fun resumeProcessing() {
+        Logger.i("ColorizationManager: Explicit RESUME requested")
+        if (_processingState.value.processState == ProcessState.RUNNING) return
+
+        changeState(ProcessState.RUNNING)
+        triggerProcessing()
+    }
+
+    fun stopProcessing() {
+        Logger.i("ColorizationManager: Explicit STOP requested")
+        changeState(ProcessState.STOPPING)
+        cancelActiveJob("User stopped")
         
         managerScope.launch {
+            dao.resetStuckItems()
+            changeState(ProcessState.IDLE)
+        }
+    }
+
+    private fun cancelActiveJob(reason: String) {
+        processingJob?.cancel(CancellationException(reason))
+        isLoopRunning.set(false)
+    }
+
+    private fun changeState(newState: ProcessState) {
+        updateState { it.copy(processState = newState, currentStatusText = newState.name) }
+        managerScope.launch {
             val appState = dao.getAppStateSync() ?: AppState()
-            dao.updateAppState(appState.copy(processState = nextState))
-            
-            if (nextState == ProcessState.PAUSED) {
-                Logger.i("ColorizationManager: Cancelling processing job due to pause")
-                processingJob?.cancel("User paused")
-                isLoopRunning.set(false)
-            } else {
-                triggerProcessing()
-            }
+            dao.updateAppState(appState.copy(processState = newState))
         }
     }
 
@@ -115,21 +133,13 @@ class ColorizationManager @Inject constructor(
         
         Logger.i("ColorizationManager: Launching new processing loop coroutine")
         processingJob = managerScope.launch {
-            updateState { it.copy(processState = ProcessState.RUNNING) }
             var currentItem: QueueItem? = null
             try {
                 while (isActive && _processingState.value.processState == ProcessState.RUNNING) {
                     currentItem = dao.getNextPendingItem()
                     if (currentItem == null) {
                         Logger.i("ColorizationManager: Loop finished - Queue empty")
-                        updateState {
-                            it.copy(
-                                processState = ProcessState.COMPLETED,
-                                currentStatusText = "Completed",
-                                currentItemSrc = null
-                            )
-                        }
-                        updatePersistentAppState()
+                        changeState(ProcessState.COMPLETED)
                         break
                     }
 
@@ -155,54 +165,29 @@ class ColorizationManager @Inject constructor(
                         dao.updateItem(currentItem.copy(status = ItemStatus.COMPLETED))
                         completedCount++
                         updateState { it.copy(completedCount = completedCount) }
-                    } else if (!isActive || _processingState.value.processState == ProcessState.PAUSED) {
-                        Logger.i("ColorizationManager: Loop interrupted while processing: $src")
-                        dao.updateItem(currentItem.copy(status = ItemStatus.PENDING)) // Reset back to pending
-                        break
                     } else {
-                        Logger.w("ColorizationManager: Item failed or skipped: $src")
-                        dao.updateItem(currentItem.copy(status = ItemStatus.FAILED, errorMessage = "Failed to colorize"))
+                        Logger.w("ColorizationManager: Loop interrupted or item failed. Active=$isActive, State=${_processingState.value.processState}")
+                        if (_processingState.value.processState == ProcessState.STOPPING || _processingState.value.processState == ProcessState.PAUSED || !isActive) {
+                             dao.updateItem(currentItem.copy(status = ItemStatus.PENDING))
+                             break
+                        } else {
+                            dao.updateItem(currentItem.copy(status = ItemStatus.FAILED, errorMessage = "Failed to colorize"))
+                        }
                     }
-                    updatePersistentAppState()
                     currentItem = null
                 }
+            } catch (e: CancellationException) {
+                Logger.i("ColorizationManager: Task cancelled (Coroutine). Reason: ${e.message}")
+                currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.PENDING)) }
             } catch (e: Exception) {
-                if (e is CancellationException) {
-                   Logger.i("ColorizationManager: Task cancelled (Coroutine). Rolling back current item.")
-                   currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.PENDING)) }
-                } else {
-                   Logger.e("ColorizationManager: Fatal exception in processing loop", e)
-                   currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.FAILED, errorMessage = "Fatal error: ${e.message}")) }
-                }
+                Logger.e("ColorizationManager: Fatal exception in processing loop", e)
+                currentItem?.let { dao.updateItem(it.copy(status = ItemStatus.FAILED, errorMessage = "Fatal error: ${e.message}")) }
             } finally {
                 isLoopRunning.set(false)
-                val finalState = _processingState.value
-                val statusText = when (finalState.processState) {
-                    ProcessState.PAUSED -> "Paused"
-                    ProcessState.COMPLETED -> "Completed"
-                    ProcessState.IDLE -> "Idle"
-                    ProcessState.RUNNING -> "Idle" // Should not happen but fallback
-                }
-                updateState { it.copy(currentStatusText = statusText, currentItemSrc = null) }
-                Logger.i("ColorizationManager: Loop exited. Status=${statusText}")
+                val finalState = _processingState.value.processState
+                updateState { it.copy(currentStatusText = finalState.name, currentItemSrc = null) }
+                Logger.i("ColorizationManager: Loop exited. Final State=$finalState")
             }
-        }
-    }
-
-    private suspend fun updatePersistentAppState() {
-        val appState = dao.getAppStateSync() ?: AppState()
-        dao.updateAppState(appState.copy(processState = _processingState.value.processState))
-    }
-
-    fun stopProcessing() {
-        Logger.i("ColorizationManager: Explicit stop requested")
-        updateState { it.copy(processState = ProcessState.IDLE, currentStatusText = "Idle") }
-        processingJob?.cancel("Stop requested")
-        isLoopRunning.set(false)
-        
-        managerScope.launch {
-            val appState = dao.getAppStateSync() ?: AppState()
-            dao.updateAppState(appState.copy(processState = ProcessState.IDLE))
         }
     }
 
@@ -230,6 +215,15 @@ class ColorizationManager @Inject constructor(
                 return@launch
             }
 
+            // Verify if it is already in the queue to avoid duplication if JS bridge sends multiple
+            val existing = dao.getItem(src)
+            if (existing != null && (existing.status == ItemStatus.COMPLETED || existing.status == ItemStatus.PROCESSING)) {
+                Logger.d("ColorizationManager: Image already processing or completed, skipping add: $src")
+                val callbacks = pendingCallbacks.getOrPut(src) { mutableSetOf() }
+                callbacks.add(onComplete)
+                return@launch
+            }
+
             Logger.d("ColorizationManager: Queuing new image: $src")
             val callbacks = pendingCallbacks.getOrPut(src) { mutableSetOf() }
             callbacks.add(onComplete)
@@ -238,11 +232,6 @@ class ColorizationManager @Inject constructor(
             
             totalInSession++
             updateState { it.copy(totalInSession = totalInSession) }
-            updatePersistentAppState()
-
-            if (_processingState.value.processState == ProcessState.RUNNING || _processingState.value.processState == ProcessState.COMPLETED) {
-                triggerProcessing()
-            }
         }
     }
 
@@ -294,7 +283,7 @@ class ColorizationManager @Inject constructor(
                     null
                 }
             }
-        } catch (e: Exception) { // Also catches CancellationException now, handled up in loop
+        } catch (e: Exception) {
             throw e
         }
     }

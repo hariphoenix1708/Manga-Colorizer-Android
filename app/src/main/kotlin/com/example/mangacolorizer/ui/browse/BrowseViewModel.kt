@@ -31,9 +31,12 @@ class BrowseViewModel @Inject constructor(
 
     var webViewBundle: android.os.Bundle? = null
 
+    private var previousState: ProcessState? = null
+
     init {
         if (colorizationManager.processingState.value.processState == ProcessState.RUNNING) {
             updateServiceState(colorizationManager.processingState.value.processState)
+            previousState = ProcessState.RUNNING
         }
 
         viewModelScope.launch {
@@ -41,7 +44,10 @@ class BrowseViewModel @Inject constructor(
                 .map { it.processState }
                 .distinctUntilChanged()
                 .collect { state ->
-                    updateServiceState(state)
+                    if (previousState != null || state == ProcessState.RUNNING) {
+                        updateServiceState(state)
+                    }
+                    previousState = state
                 }
         }
     }

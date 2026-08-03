@@ -82,9 +82,10 @@ class ColorizationManager @Inject constructor(
         
         activeSessionToken = UUID.randomUUID().toString()
         completedCount = 0
-        totalInSession = 0
+        val currentPending = _processingState.value.pendingCount
+        totalInSession = currentPending
 
-        updateState { it.copy(sessionToken = activeSessionToken, completedCount = 0, totalInSession = 0) }
+        updateState { it.copy(sessionToken = activeSessionToken, completedCount = 0, totalInSession = totalInSession) }
         changeState(ProcessState.RUNNING)
         triggerProcessing()
     }
@@ -108,6 +109,8 @@ class ColorizationManager @Inject constructor(
     }
 
     private fun changeState(newState: ProcessState) {
+        val oldState = _processingState.value.processState
+        Logger.i("ColorizationManager: State changed from $oldState to $newState")
         updateState { it.copy(processState = newState, currentStatusText = newState.name) }
         managerScope.launch {
             val appState = dao.getAppStateSync() ?: AppState()

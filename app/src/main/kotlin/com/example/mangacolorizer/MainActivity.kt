@@ -141,8 +141,8 @@ fun MainContainer(colorizer: MangaColorizer) {
 
     LaunchedEffect(Unit) {
         try {
-            Logger.i("MainContainer: Loading alacgan.onnx model...")
-            colorizer.loadModel("alacgan.onnx")
+            Logger.i("MainContainer: Loading alacgan_qdq.onnx model...")
+            colorizer.loadModel("alacgan_qdq.onnx")
             isModelLoaded = true
             Logger.i("MainContainer: Model loaded successfully")
         } catch (e: Exception) {

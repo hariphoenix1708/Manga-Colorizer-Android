@@ -99,7 +99,11 @@ fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        val progressText = if (processingCount > 0) "Manga AI: $processingCount pages left" else "Finalizing..."
+                        val progressText = when {
+                            processingCount > 0 -> "Manga AI: $processingCount pages left"
+                            processingState.currentItemSrc != null -> "Finalizing..."
+                            else -> "Waiting for pages..."
+                        }
                         Text(
                             text = progressText,
                             style = MaterialTheme.typography.labelMedium,

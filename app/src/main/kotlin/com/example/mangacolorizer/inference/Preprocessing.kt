@@ -18,8 +18,9 @@ object Preprocessing {
     fun resizeAndPad(bitmap: Bitmap): Pair<Bitmap, IntArray> {
         // Downscale huge images to prevent OOM before we even start
         var source = bitmap
-        if (bitmap.width > 2000 || bitmap.height > 2000) {
-            val scale = 2000f / Math.max(bitmap.width, bitmap.height)
+        val longSide = Math.max(bitmap.width, bitmap.height)
+        if (longSide > 1600) {
+            val scale = 1600f / longSide
             source = Bitmap.createScaledBitmap(
                 bitmap, 
                 (bitmap.width * scale).toInt(), 

@@ -42,25 +42,32 @@ class MangaColorizer(private val context: Context) {
             }
 
             val options = OrtSession.SessionOptions()
+            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
             
-            try {
-                Logger.d("AI: Attempting NPU acceleration (QNN/NNAPI)")
-                try {
-                    options.addConfigEntry("session.use_qnn", "1")
-                    options.addConfigEntry("qnn.backend_path", "libQnnHtp.so")
-                    Logger.i("AI: QNN HTP Backend enabled")
-                } catch (e: Exception) {
-                    Logger.w("AI: QNN HTP unavailable, trying NNAPI: ${e.message}")
-                    options.addConfigEntry("session.use_nnapi", "1")
-                }
-                
-                options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-                options.setIntraOpNumThreads(4)
-                isNpuSupported = true
+            isNpuSupported = try {
+                val qnnOptions = mapOf(
+                    "backend_path" to "libQnnHtp.so",
+                    "htp_performance_mode" to "burst",
+                    "enable_htp_fp16_precision" to "1",
+                    "qnn_context_priority" to "high"
+                )
+                options.addQnn(qnnOptions)
+                Logger.i("AI: QNN HTP execution provider attached successfully")
+                true
             } catch (e: Exception) {
-                isNpuSupported = false
-                Logger.e("AI: NPU initialization failed, using CPU", e)
+                Logger.w("AI: QNN HTP unavailable (${e.message}), trying NNAPI")
+                try {
+                    options.addNnapi()
+                    Logger.i("AI: NNAPI execution provider attached as fallback")
+                    true
+                } catch (e2: Exception) {
+                    Logger.e("AI: NNAPI also unavailable, falling back to CPU", e2)
+                    false
+                }
             }
+
+            options.setIntraOpNumThreads(4)
 
             session = env.createSession(modelFile.absolutePath, options)
             Logger.i("AI: Session created (NPU=$isNpuSupported)")

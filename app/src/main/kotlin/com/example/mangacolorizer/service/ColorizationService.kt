@@ -76,20 +76,22 @@ class ColorizationService : Service() {
             }
         }
         
-        collectorJob?.cancel()
-        collectorJob = serviceScope.launch {
-            manager.processingState.collect { state ->
-                val status = state.currentStatusText
-                val processed = state.completedCount
-                val total = state.totalInSession
+        if (collectorJob == null || collectorJob?.isActive == false) {
+            collectorJob?.cancel()
+            collectorJob = serviceScope.launch {
+                manager.processingState.collect { state ->
+                    val status = state.currentStatusText
+                    val processed = state.completedCount
+                    val total = state.totalInSession
 
-                Logger.d("ColorizationService: Syncing notification (Status=$status, Processed=$processed, Total=$total, State=${state.processState})")
+                    Logger.d("ColorizationService: Syncing notification (Status=$status, Processed=$processed, Total=$total, State=${state.processState})")
 
-                if (state.processState == ProcessState.IDLE) {
-                    Logger.i("ColorizationService: Conditions met for termination (State: ${state.processState}). Stopping.")
-                    stopServiceCleanly()
-                } else {
-                    updateNotification(status, processed, total)
+                    if (state.processState == ProcessState.IDLE) {
+                        Logger.i("ColorizationService: Conditions met for termination (State: ${state.processState}). Stopping.")
+                        stopServiceCleanly()
+                    } else {
+                        updateNotification(status, processed, total)
+                    }
                 }
             }
         }

@@ -273,7 +273,7 @@ fun BrowseScreen(viewModel: BrowseViewModel, onClose: () -> Unit) {
                 )
             },
             text = {
-                Text(if (isRunning) "STOP PROCESS" else "START COLORING")
+                Text(if (isRunning) "Stop Processing" else "Start Processing")
             }
         )
     }
